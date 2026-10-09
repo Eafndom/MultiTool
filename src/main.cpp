@@ -10,6 +10,14 @@
 #include "Pacer.h"
 #include "SystemManager.h"
 #include "GameDetector.h"
+#include "UI.h"
+#include "DataManager.h"
+#include "PerformanceMonitor.h"
+#include "RuleEngine.h"
+#include "Logger.h"
+#include "SessionRecorder.h"
+#include "StateRestorer.h"
+#include "SystemControl.h"
 #include <locale>
 #include <codecvt>
 
@@ -146,7 +154,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     Pacer& pacer = Pacer::Get();
     pacer.Initialize();
 
+    Logger::Get().Init("log.txt");
+    DataManager::Get().Load();
+    PerformanceMonitor::Get().Initialize();
+
     GameDetector& detector = GameDetector::Get();
+    detector.OnGameDetected = [&](const std::wstring& processName, DWORD pid) {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        std::string gameName = converter.to_bytes(processName);
+        PerformanceMonitor::Get().SetGameProcess(pid, processName);
+        StateRestorer::Get().CaptureState(pid);
+
+        auto gameOpt = DataManager::Get().GetGameByProcessName(gameName);
+        if (gameOpt && gameOpt->autoApply) {
+            auto profileOpt = DataManager::Get().GetProfileByName(gameOpt->profileName);
+            if (profileOpt) {
+                const auto& p = profileOpt.value();
+                DWORD origPrio = SystemControl::Get().GetProcessPriority(pid);
+                DWORD_PTR origAffinity = SystemControl::Get().GetProcessAffinity(pid);
+                StateRestorer::Get().RegisterModifiedProcess(pid, origPrio, origAffinity);
+
+                SystemControl::Get().SetProcessPriority(pid, p.processPriority);
+                if (p.processAffinity != 0) SystemControl::Get().SetProcessAffinity(pid, p.processAffinity);
+                if (p.displayWidth > 0 && p.displayHeight > 0 && p.displayRefreshRate > 0) {
+                    SystemControl::Get().ChangeDisplaySettings(p.displayWidth, p.displayHeight, p.displayRefreshRate);
+                }
+                if (!p.powerPlanGuid.empty()) {
+                    GUID guid;
+                    if (SystemControl::ParseGuid(p.powerPlanGuid, guid)) SystemControl::Get().SetActivePowerPlan(guid);
+                }
+                if (p.targetFPS > 0.0) { Pacer::Get().SetTargetFPS(p.targetFPS); Pacer::Get().SetEnabled(true); }
+            }
+        }
+    };
+
+    detector.OnGameLost = [&]() {
+        PerformanceMonitor::Get().SetGameProcess(0, L"");
+        StateRestorer::Get().RestoreState();
+    };
+
     detector.Start();
 
     double currentTargetFPS = 120.0;
@@ -186,44 +232,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::Begin("FramePacer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        ImGui::Begin("GamingPerformanceControlCenter", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-        ImGui::Text("FramePacer Clone");
-        ImGui::Separator();
-
-        std::wstring wGameName = detector.GetCurrentGameName();
-        std::string gameName = "None";
-        if (!wGameName.empty()) {
-            std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-            gameName = converter.to_bytes(wGameName);
+        if (ImGui::BeginTabBar("MainTabs")) {
+            if (ImGui::BeginTabItem("Dashboard")) { UI::RenderDashboard(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Games")) {
+                ImGui::Text("Games & Triggers");
+                ImGui::Separator();
+                auto& games = DataManager::Get().games;
+                for (auto& g : games) {
+                    if (ImGui::TreeNode(g.processName.c_str())) {
+                        char nameBuf[256]; strncpy(nameBuf, g.processName.c_str(), sizeof(nameBuf)); nameBuf[sizeof(nameBuf)-1] = 0;
+                        if (ImGui::InputText("Process Name", nameBuf, sizeof(nameBuf))) g.processName = nameBuf;
+                        char profBuf[256]; strncpy(profBuf, g.profileName.c_str(), sizeof(profBuf)); profBuf[sizeof(profBuf)-1] = 0;
+                        if (ImGui::InputText("Profile To Apply", profBuf, sizeof(profBuf))) g.profileName = profBuf;
+                        ImGui::Checkbox("Auto Apply", &g.autoApply);
+                        ImGui::TreePop();
+                    }
+                }
+                if (ImGui::Button("Add Game Trigger")) {
+                    GameSettings g; g.processName = "NewGame.exe"; g.profileName = "Default"; games.push_back(g);
+                }
+                if (ImGui::Button("Save Data")) DataManager::Get().Save();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Profiles")) { UI::RenderProfileEditor(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Rules")) { UI::RenderRuleEditor(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Session Analysis")) { UI::RenderSessionAnalysis(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Benchmark")) { UI::RenderBenchmarkTab(); ImGui::EndTabItem(); }
+            ImGui::EndTabBar();
         }
-        ImGui::Text("Current Game: %s", gameName.c_str());
-        ImGui::Separator();
-
-        bool enabled = pacer.IsEnabled();
-        if (ImGui::Checkbox("Enable Pacing", &enabled)) {
-            pacer.SetEnabled(enabled);
-        }
-
-        if (ImGui::InputDouble("Target FPS", &currentTargetFPS, 1.0, 5.0, "%.1f")) {
-            pacer.SetTargetFPS(currentTargetFPS);
-        }
-
-        FrameStats stats = pacer.GetStats();
-        ImGui::Text("Current FPS: %.1f", stats.currentFPS);
-        ImGui::Text("Avg FPS: %.1f", stats.averageFPS);
-        ImGui::Text("Current Frame Time: %.2f ms", stats.currentFrameTimeMs);
-        ImGui::Text("Avg Frame Time: %.2f ms", stats.averageFrameTimeMs);
-        ImGui::Text("Target Frame Time: %.2f ms", stats.targetFrameTimeMs);
-        ImGui::Text("1%% Low: %.2f ms", stats.onePercentLowMs);
-        ImGui::Text("0.1%% Low: %.2f ms", stats.zeroOnePercentLowMs);
-        ImGui::Text("Stutter Count: %d", stats.stutterCount);
-
-        const auto& history = pacer.GetFrameTimeHistory();
-        std::vector<float> graphData(history.size());
-        for(size_t i=0; i<history.size(); ++i) graphData[i] = static_cast<float>(history[i]);
-
-        ImGui::PlotLines("Frame Time (ms)", graphData.data(), (int)graphData.size(), 0, nullptr, 0.0f, (float)(stats.targetFrameTimeMs * 2.0), ImVec2(0, 150));
 
         ImGui::End();
 
@@ -236,6 +274,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_pSwapChain->Present(0, 0);
 
         pacer.WaitAndPace();
+
+        if (SessionRecorder::Get().IsRecording()) {
+            SessionRecorder::Get().RecordFrame(pacer.GetStats().currentFrameTimeMs);
+        }
+
+        static auto lastUpdate = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 1000) {
+            PerformanceMonitor::Get().Update();
+            std::wstring wGameName = detector.GetCurrentGameName();
+            std::string gameName = "None";
+            if (!wGameName.empty()) {
+                std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+                gameName = converter.to_bytes(wGameName);
+            }
+            RuleEngine::Get().Evaluate(PerformanceMonitor::Get().GetMetrics(), gameName);
+            lastUpdate = now;
+        }
     }
 
     detector.Stop();
