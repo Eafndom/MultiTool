@@ -30,6 +30,7 @@ public:
 
     FrameStats GetStats() const;
     const std::vector<double>& GetFrameTimeHistory() const;
+    const std::vector<double>& GetRawFrameTimes() const { return m_frameTimeHistory; }
 
     bool IsEnabled() const { return m_enabled; }
     void SetEnabled(bool enabled) { m_enabled = enabled; }

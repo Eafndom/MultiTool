@@ -1,0 +1,15 @@
+{
+    "games": [],
+    "profiles": [
+        {
+            "displayHeight": 1080,
+            "displayRefreshRate": 144,
+            "displayWidth": 1920,
+            "name": "TestProfile",
+            "powerPlanGuid": "guid",
+            "processAffinity": 1,
+            "processPriority": 1,
+            "targetFPS": 120.0
+        }
+    ]
+}
